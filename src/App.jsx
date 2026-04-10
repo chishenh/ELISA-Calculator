@@ -3,6 +3,8 @@ import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, Scatter, ComposedChart
 } from 'recharts';
 import { Settings, Edit3, Activity, Calculator, RefreshCw, Trash2, FileText, BarChart2, Download, Grid, Play, Clipboard, RotateCcw, XCircle, AlertTriangle, Sigma, Info } from 'lucide-react';
+import ExcelJS from 'exceljs';
+import { saveAs } from 'file-saver';
 
 // --- Helper: Dynamic Script Loader for PDF Libraries ---
 const loadScript = (src) => {
@@ -204,8 +206,8 @@ const getAutoLayout = (settings, standards) => {
 };
 
 const INITIAL_STD_CONCS = [
-  { id: 1, conc: 100 }, { id: 2, conc: 50 }, { id: 3, conc: 25 }, { id: 4, conc: 12.5 },
-  { id: 5, conc: 6.25 }, { id: 6, conc: 3.125 }, { id: 7, conc: 1.56 }, { id: 8, conc: 0 }
+  { id: 1, conc: 250 }, { id: 2, conc: 125 }, { id: 3, conc: 62.5 }, { id: 4, conc: 31.25 },
+  { id: 5, conc: 15.625 }, { id: 6, conc: 7.813 }, { id: 7, conc: 3.906 }, { id: 8, conc: 0 }
 ];
 const INITIAL_REPEAT_SETTINGS = { std: 2, ctl: 2, sample: 1 };
 
@@ -357,6 +359,7 @@ export default function App() {
   const [calculatedData, setCalculatedData] = useState([]);
   const [chartScale, setChartScale] = useState('log');
   const [isGeneratingDoc, setIsGeneratingDoc] = useState(false);
+  const [isGeneratingExcel, setIsGeneratingExcel] = useState(false);
   const chartRef = useRef(null);
 
   const clearLayout = () => {
@@ -562,6 +565,7 @@ export default function App() {
       const descA = isIncreasing ? "Min Asymptote (Bottom)" : "Max Asymptote (Top)";
       const descD = isIncreasing ? "Max Asymptote (Top)" : "Min Asymptote (Bottom)";
 
+      const ec50 = fitResult.params.c * Math.pow((Math.pow(2, 1 / fitResult.params.g) - 1), 1 / fitResult.params.b);
       doc.setFontSize(12); doc.text("3.2. 5PL Parameters & Goodness of Fit", 14, chartY + 12);
       doc.autoTable({
         startY: chartY + 17,
@@ -570,9 +574,10 @@ export default function App() {
           ["R-Squared", fitResult.rSquared.toFixed(5), "Coefficient of Determination"],
           ["A", fitResult.params.a.toFixed(4), descA],
           ["D", fitResult.params.d.toFixed(4), descD],
-          ["C", fitResult.params.c.toFixed(4), "Inflection Point (EC50)"],
+          ["C", fitResult.params.c.toFixed(4), "Inflection Point"],
           ["B", fitResult.params.b.toFixed(4), "Hill Slope"],
-          ["G", fitResult.params.g.toFixed(4), "Symmetry Factor"]
+          ["G", fitResult.params.g.toFixed(4), "Symmetry Factor"],
+          ["EC50", ec50.toFixed(4), "Half Maximal Effective Concentration"]
         ],
         theme: 'grid',
         headStyles: { fillColor: [79, 70, 229], halign: 'center' },
@@ -637,8 +642,168 @@ export default function App() {
       });
 
       doc.autoTable({ startY: 25, head: [['Well', 'Sample ID', 'OD', 'Concentration', 'Avg Conc.', 'SD', 'CV (%)']], body: sampleBody, theme: 'grid', headStyles: { fillColor: [234, 88, 12], halign: 'center' }, styles: { halign: 'center' }, tableWidth: '100%' });
-      doc.save("ELISA_Report_LMA.pdf");
+      
+      const today = new Date();
+      const dateStr = today.getFullYear() + String(today.getMonth() + 1).padStart(2, '0') + String(today.getDate()).padStart(2, '0');
+      doc.save(`${dateStr}_ELISA_Results.pdf`);
     } catch (e) { alert("PDF Error"); console.error(e); } finally { setIsGeneratingDoc(false); }
+  };
+
+  const handleDownloadExcel = async () => {
+    if (!fitResult || calculatedData.length === 0) return alert("Please calculate fit first.");
+    setIsGeneratingExcel(true);
+    try {
+      const workbook = new ExcelJS.Workbook();
+      workbook.creator = 'ELISA Calculator';
+      
+      // Sheet 1: Plate Layout
+      const ws1 = workbook.addWorksheet('Plate Layout');
+      const layoutData = [];
+      layoutData.push(['', ...Array.from({ length: 12 }, (_, i) => i + 1)]);
+      ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H'].forEach((r, i) => {
+        const row = [r, ...layout[i].map(c => {
+          if (c.type === 'EMPTY') return '';
+          if (c.type === 'STD') return `STD${c.id}`;
+          if (c.type === 'CTL') return `CTL-${c.id}`;
+          return c.id;
+        })];
+        layoutData.push(row);
+      });
+      ws1.addRows(layoutData);
+      
+      // Sheet 2: OD Value Layout
+      const ws2 = workbook.addWorksheet('OD Value Layout');
+      const odData = [];
+      odData.push(['', ...Array.from({ length: 12 }, (_, i) => i + 1)]);
+      ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H'].forEach((r, i) => {
+        const row = [r, ...odValues[i].map(val => val === '' ? '-' : val)];
+        odData.push(row);
+      });
+      ws2.addRows(odData);
+
+      // Sheet 3: Curve Fitting Results
+      const ws3 = workbook.addWorksheet('Curve Fitting Results');
+      const descA_ex = fitResult.params.a < fitResult.params.d ? "Min Asymptote (Bottom)" : "Max Asymptote (Top)";
+      const descD_ex = fitResult.params.a < fitResult.params.d ? "Max Asymptote (Top)" : "Min Asymptote (Bottom)";
+      const ec50_ex = fitResult.params.c * Math.pow((Math.pow(2, 1 / fitResult.params.g) - 1), 1 / fitResult.params.b);
+
+      ws3.addRow(['Parameter', 'Value', 'Description']);
+      const rSquareRow = ws3.addRow(['R-Squared', fitResult.rSquared, 'Coefficient of Determination']);
+      rSquareRow.getCell(2).numFmt = '0.00000';
+      const aRow = ws3.addRow(['A', fitResult.params.a, descA_ex]);
+      aRow.getCell(2).numFmt = '0.0000';
+      const dRow = ws3.addRow(['D', fitResult.params.d, descD_ex]);
+      dRow.getCell(2).numFmt = '0.0000';
+      const cRow = ws3.addRow(['C', fitResult.params.c, 'Inflection Point']);
+      cRow.getCell(2).numFmt = '0.0000';
+      const bRow = ws3.addRow(['B', fitResult.params.b, 'Hill Slope']);
+      bRow.getCell(2).numFmt = '0.0000';
+      const gRow = ws3.addRow(['G', fitResult.params.g, 'Symmetry Factor']);
+      gRow.getCell(2).numFmt = '0.0000';
+      const ec50Row = ws3.addRow(['EC50', ec50_ex, 'Half Maximal Effective Concentration']);
+      ec50Row.getCell(2).numFmt = '0.0000';
+      ws3.addRow([]);
+      ws3.addRow(['Model Formula', 'y = D + (A - D) / ((1 + (x/C)^B)^G)']);
+      ws3.addRow([]);
+      
+      try {
+        await loadScript("https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js");
+        const chartContainer = document.getElementById('chart-container');
+        if (chartContainer) {
+          const canvas = await window.html2canvas(chartContainer, { scale: 2, useCORS: true, logging: false, backgroundColor: '#ffffff' });
+          const imgData = canvas.toDataURL('image/png');
+          const imageId = workbook.addImage({ base64: imgData, extension: 'png' });
+          ws3.addImage(imageId, {
+            tl: { col: 0, row: 13 },
+            ext: { width: Math.round(canvas.width * 0.4), height: Math.round(canvas.height * 0.4) }
+          });
+        }
+      } catch (e) {
+        console.error("Failed to capture chart image for Excel:", e);
+      }
+
+      // Sheet 4: Standard Curve Statistics
+      const ws4 = workbook.addWorksheet('Standard Curve Statistics');
+      ws4.addRow(['ID', 'Well', 'Std Conc.', 'OD', 'Back-calc', 'Avg Conc.', 'SD', 'CV (%)']);
+      const stdGroups = {};
+      calculatedData.filter(d => d.type === 'STD').forEach(d => { if (!stdGroups[d.id]) stdGroups[d.id] = { wells: [] }; stdGroups[d.id].wells.push(d); });
+      Object.keys(stdGroups).sort((a, b) => parseInt(a) - parseInt(b)).forEach(id => {
+        const group = stdGroups[id];
+        const validConcs = group.wells.map(w => w.conc).filter(c => !isNaN(c));
+        const { mean, sd, cv } = calcStats(validConcs);
+        const stdDef = stdConcs.find(s => s.id === parseInt(id));
+        const theoConc = stdDef ? stdDef.conc : '-';
+        group.wells.forEach((well, idx) => {
+          ws4.addRow([
+            idx === 0 ? `STD ${id}` : '',
+            well.well,
+            idx === 0 ? theoConc : '',
+            Number(well.od),
+            isNaN(well.conc) ? "Out of Range" : well.conc,
+            idx === 0 ? mean : '',
+            idx === 0 ? (sd !== null ? sd : 'NA') : '',
+            idx === 0 ? (cv !== null ? cv : 'NA') : ''
+          ]);
+        });
+      });
+      ws4.getColumn(4).numFmt = '0.000';
+      ws4.getColumn(5).numFmt = '0.000';
+      ws4.getColumn(6).numFmt = '0.000';
+      ws4.getColumn(7).numFmt = '0.000';
+      ws4.getColumn(8).numFmt = '0.0';
+
+      // Sheet 5: Sample Concentrations
+      const ws5 = workbook.addWorksheet('Sample Concentrations');
+      ws5.addRow(['Well', 'Sample ID', 'OD', 'Concentration', 'Avg Conc.', 'SD', 'CV (%)']);
+      const sampleGroups = {};
+      calculatedData.filter(d => d.type !== 'STD').forEach(d => {
+        const key = `${d.type}-${d.id}`;
+        if (!sampleGroups[key]) sampleGroups[key] = { type: d.type, id: d.id, wells: [] };
+        sampleGroups[key].wells.push(d);
+      });
+      const typePriority = { 'CTL': 0, 'UNK': 1, 'BLK': 2 };
+      const getPriority = (t) => typePriority[t] ?? 9;
+      Object.values(sampleGroups).sort((a, b) => {
+        const pA = getPriority(a.type);
+        const pB = getPriority(b.type);
+        if (pA !== pB) return pA - pB;
+        if (a.type === 'CTL' && b.type === 'CTL') {
+          if (a.id === 'H' && b.id === 'L') return -1;
+          if (a.id === 'L' && b.id === 'H') return 1;
+        }
+        return String(a.id).localeCompare(String(b.id), undefined, { numeric: true });
+      }).forEach(group => {
+        const validConcs = group.wells.map(w => w.conc).filter(c => !isNaN(c));
+        const { mean, sd, cv } = calcStats(validConcs);
+        const displayName = group.type === 'UNK' ? group.id : group.type === 'CTL' ? `CTL-${group.id}` : group.id;
+        group.wells.forEach((well, idx) => {
+          ws5.addRow([
+            well.well,
+            displayName,
+            Number(well.od),
+            isNaN(well.conc) ? "Out of Range" : well.conc,
+            idx === 0 ? (isNaN(mean) ? '-' : mean) : '',
+            idx === 0 ? (sd === null ? '' : sd) : '',
+            idx === 0 ? (cv === null ? '' : cv) : ''
+          ]);
+        });
+      });
+      ws5.getColumn(3).numFmt = '0.000';
+      ws5.getColumn(4).numFmt = '0.000';
+      ws5.getColumn(5).numFmt = '0.000';
+      ws5.getColumn(6).numFmt = '0.000';
+      ws5.getColumn(7).numFmt = '0.0';
+
+      const buffer = await workbook.xlsx.writeBuffer();
+      const today = new Date();
+      const dateStr = today.getFullYear() + String(today.getMonth() + 1).padStart(2, '0') + String(today.getDate()).padStart(2, '0');
+      saveAs(new Blob([buffer]), `${dateStr}_ELISA_Results.xlsx`);
+    } catch (e) {
+      alert("Excel Generation Error");
+      console.error(e);
+    } finally {
+      setIsGeneratingExcel(false);
+    }
   };
 
   const renderStdStatsTable = () => {
@@ -764,9 +929,21 @@ export default function App() {
                 <div className="flex flex-col items-center justify-center h-64 text-gray-400 border-2 border-dashed rounded-lg"><Activity className="w-12 h-12 mb-2 opacity-20" /><p>Please enter data and click "Calculate Fit"</p></div>
               ) : (
                 <>
-                  <div className="flex justify-between items-center"><h2 className="text-lg font-bold text-gray-800">Analysis Results</h2><button onClick={handleDownloadPdf} disabled={isGeneratingDoc} className="flex items-center gap-1 text-xs bg-rose-600 text-white px-3 py-1.5 rounded hover:bg-rose-700 shadow-sm disabled:opacity-50">{isGeneratingDoc ? <RefreshCw className="w-3 h-3 animate-spin" /> : <Download className="w-3 h-3" />}{isGeneratingDoc ? "Processing..." : "Download PDF"}</button></div>
+                  <div className="flex justify-between items-center">
+                    <h2 className="text-lg font-bold text-gray-800">Analysis Results</h2>
+                    <div className="flex gap-2">
+                      <button onClick={handleDownloadExcel} disabled={isGeneratingExcel} className="flex items-center gap-1 text-xs bg-emerald-600 text-white px-3 py-1.5 rounded hover:bg-emerald-700 shadow-sm disabled:opacity-50">
+                        {isGeneratingExcel ? <RefreshCw className="w-3 h-3 animate-spin" /> : <Download className="w-3 h-3" />}
+                        {isGeneratingExcel ? "Processing..." : "Download Excel"}
+                      </button>
+                      <button onClick={handleDownloadPdf} disabled={isGeneratingDoc} className="flex items-center gap-1 text-xs bg-rose-600 text-white px-3 py-1.5 rounded hover:bg-rose-700 shadow-sm disabled:opacity-50">
+                        {isGeneratingDoc ? <RefreshCw className="w-3 h-3 animate-spin" /> : <Download className="w-3 h-3" />}
+                        {isGeneratingDoc ? "Processing..." : "Download PDF"}
+                      </button>
+                    </div>
+                  </div>
                   <div className="flex flex-col lg:flex-row gap-6 mb-6">
-                    <div className="lg:w-1/3"><div className="bg-white border border-slate-200 rounded-lg p-5 shadow-sm h-full"><h4 className="font-bold text-slate-700 mb-4 text-base border-b pb-2">Fit Parameters</h4><div className="mb-6 p-4 bg-green-50 border border-green-100 rounded-lg text-center"><div className="text-xs text-green-600 font-semibold uppercase tracking-wider mb-1">Goodness of Fit (R²)</div><div className="text-3xl font-bold text-green-700 tracking-tight">{fitResult.rSquared.toFixed(5)}</div></div><div className="mb-4 p-3 bg-slate-50 border border-slate-200 rounded text-center"><div className="text-xs text-slate-500 mb-1">5PL Model Formula</div><div className="font-mono text-xs font-bold text-indigo-700 mt-2">y = D + (A - D) / ((1 + (x/C)^B)^G)</div></div><div className="space-y-3">{['a', 'd', 'c', 'b', 'g'].map(p => <div key={p} className="flex justify-between items-center text-sm"><span className="text-slate-500">{p.toUpperCase()}</span><span className="font-mono font-bold text-slate-700 bg-slate-50 px-2 py-0.5 rounded">{fitResult.params[p].toFixed(4)}</span></div>)}</div></div></div>
+                    <div className="lg:w-1/3"><div className="bg-white border border-slate-200 rounded-lg p-5 shadow-sm h-full"><h4 className="font-bold text-slate-700 mb-4 text-base border-b pb-2">Fit Parameters</h4><div className="mb-6 p-4 bg-green-50 border border-green-100 rounded-lg text-center"><div className="text-xs text-green-600 font-semibold uppercase tracking-wider mb-1">Goodness of Fit (R²)</div><div className="text-3xl font-bold text-green-700 tracking-tight">{fitResult.rSquared.toFixed(5)}</div></div><div className="mb-4 p-3 bg-slate-50 border border-slate-200 rounded text-center"><div className="text-xs text-slate-500 mb-1">5PL Model Formula</div><div className="font-mono text-xs font-bold text-indigo-700 mt-2">y = D + (A - D) / ((1 + (x/C)^B)^G)</div></div><div className="space-y-3">{['a', 'd', 'c', 'b', 'g'].map(p => <div key={p} className="flex justify-between items-center text-sm"><span className="text-slate-500">{p.toUpperCase()}</span><span className="font-mono font-bold text-slate-700 bg-slate-50 px-2 py-0.5 rounded">{fitResult.params[p].toFixed(4)}</span></div>)}<div className="flex justify-between items-center text-sm"><span className="text-slate-500 font-bold text-indigo-700">EC50</span><span className="font-mono font-bold text-indigo-700 bg-indigo-50 px-2 py-0.5 rounded border border-indigo-200">{(fitResult.params.c * Math.pow((Math.pow(2, 1/fitResult.params.g) - 1), 1/fitResult.params.b)).toFixed(4)}</span></div></div></div></div>
                     <div className="lg:w-2/3"><div className="bg-white border border-slate-200 rounded-lg p-4 shadow-sm h-full flex flex-col"><div className="flex justify-between items-center mb-2"><h4 className="font-bold text-slate-700">Standard Curve</h4><div className="flex bg-gray-100 rounded p-1"><button onClick={() => setChartScale('log')} className={`px-2 py-1 text-xs rounded ${chartScale === 'log' ? 'bg-white shadow text-indigo-600 font-bold' : 'text-slate-500'}`}>Log</button><button onClick={() => setChartScale('linear')} className={`px-2 py-1 text-xs rounded ${chartScale === 'linear' ? 'bg-white shadow text-indigo-600 font-bold' : 'text-slate-500'}`}>Linear</button></div></div><div id="chart-container" className="flex-1 min-h-[400px] h-[400px] w-full"><ResponsiveContainer width="100%" height="100%"><ComposedChart margin={{ top: 20, right: 30, bottom: 50, left: 20 }}><CartesianGrid strokeDasharray="3 3" /><XAxis dataKey="x" type="number" scale={chartScale} domain={[0.1, 1000]} allowDataOverflow ticks={chartScale === 'log' ? [0.1, 1, 10, 100, 1000] : null} tickFormatter={t => chartScale === 'log' ? Number(t).toString() : parseInt(t)} label={{ value: `Concentration`, position: 'insideBottom', offset: -10 }} /><YAxis dataKey="y" type="number" label={{ value: 'OD', angle: -90, position: 'insideLeft' }} /><Tooltip labelFormatter={l => `Conc: ${Number(l).toFixed(3)}`} formatter={v => v.toFixed(3)} /><Legend verticalAlign="top" wrapperStyle={{ paddingBottom: '20px' }} /><Line data={getChartData.curve} type="monotone" dataKey="y" stroke="#4f46e5" dot={false} name="Fit Curve" isAnimationActive={false} /><Scatter data={getChartData.scatter} fill="#ef4444" name="Standards" /></ComposedChart></ResponsiveContainer></div></div></div>
                   </div>
                   {renderStdStatsTable()}
