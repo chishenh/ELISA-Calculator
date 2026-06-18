@@ -81,7 +81,9 @@ const solveLevenbergMarquardt = (dataPoints, initialParamsObj) => {
   const tolerance = 1e-8;
 
   const getSSE = (params) => {
-    if (params.some(val => val <= 1e-9)) return Infinity;
+    // a (params[0]) and d (params[1]) can be negative (e.g. background-subtracted OD).
+    // c, b, g (params[2], [3], [4]) must remain positive to avoid NaN in Math.log/Math.pow.
+    if (params[2] <= 1e-9 || params[3] <= 1e-9 || params[4] <= 1e-9) return Infinity;
     return dataPoints.reduce((acc, point) => {
       const diff = point.y - calculate5PL(point.x, params);
       return acc + diff * diff;
@@ -452,8 +454,8 @@ export default function App() {
     const isIncreasing = yEnd > yStart;
     const minY = Math.min(...points.map(p => p.y));
     const maxY = Math.max(...points.map(p => p.y));
-    const safeMin = minY > 0 ? minY : 0.001;
-    const safeMax = maxY > 0 ? maxY : 0.001;
+    const safeMin = minY;
+    const safeMax = maxY;
     let initA = isIncreasing ? safeMin : safeMax;
     let initD = isIncreasing ? safeMax : safeMin;
     const midY = (minY + maxY) / 2;
