@@ -249,31 +249,33 @@ const PlateGrid = ({ data, setData, type = "layout", activeTool }) => {
     return cell.id;
   };
 
+  const parseLayoutCell = (rawVal) => {
+    if (rawVal === undefined || rawVal === null) return { type: 'EMPTY', id: null };
+    const val = String(rawVal).trim();
+    if (val === '' || val === '-' || val === '.' || val.toUpperCase() === 'EMPTY') {
+      return { type: 'EMPTY', id: null };
+    }
+    const upperVal = val.toUpperCase();
+    if (upperVal.startsWith('STD') || upperVal.startsWith('STANDARD')) {
+      const idPart = val.replace(/^(STANDARD|STD)[-_ \t]*/i, '').trim();
+      return { type: 'STD', id: idPart };
+    }
+    if (upperVal.startsWith('CTL') || upperVal.startsWith('CONTROL') || upperVal.startsWith('QC')) {
+      const idPart = val.replace(/^(CONTROL|CTL|QC)[-_ \t]*/i, '').trim();
+      return { type: 'CTL', id: idPart };
+    }
+    if (upperVal === 'BLK' || upperVal === 'BLANK' || upperVal === 'B') {
+      return { type: 'BLK', id: '' };
+    }
+    return { type: 'UNK', id: val };
+  };
+
   const handleCellClick = (rIndex, cIndex) => { };
 
   const handleTextChange = (rIndex, cIndex, val, field) => {
-    const newData = [...data];
+    const newData = data.map(row => row.map(cell => (typeof cell === 'object' && cell !== null ? { ...cell } : cell)));
     if (field === 'id') {
-      let newType = 'UNK';
-      let newId = val;
-      const upperVal = val.toUpperCase();
-      if (upperVal.startsWith('STD')) {
-        newType = 'STD';
-        newId = val.substring(3);
-      } else if (upperVal.startsWith('CTL')) {
-        newType = 'CTL';
-        newId = val.replace(/^CTL-?/i, '');
-      } else if (upperVal === 'BLK' || upperVal === 'BLANK') {
-        newType = 'BLK';
-        newId = '';
-      } else if (val === '') {
-        newType = 'EMPTY';
-        newId = null;
-      } else {
-        newType = 'UNK';
-        newId = val;
-      }
-      newData[rIndex][cIndex] = { type: newType, id: newId };
+      newData[rIndex][cIndex] = parseLayoutCell(val);
     } else {
       newData[rIndex][cIndex] = val;
     }
@@ -283,34 +285,67 @@ const PlateGrid = ({ data, setData, type = "layout", activeTool }) => {
   const handlePaste = (e, rIndex, cIndex, field) => {
     e.preventDefault();
     const clipboardData = e.clipboardData.getData('text');
-    const pasteRows = clipboardData.split(/\r\n|\n|\r/).filter(row => row.trim() !== '');
-    if (pasteRows.length === 0) return;
-    const newData = [...data];
-    pasteRows.forEach((rowStr, rOffset) => {
-      const targetRow = rIndex + rOffset;
-      if (targetRow >= 8) return;
-      const pasteCols = rowStr.split('\t');
-      pasteCols.forEach((val, cOffset) => {
-        const targetCol = cIndex + cOffset;
-        if (targetCol >= 12) return;
-        const cleanVal = val.trim();
-        if (type === 'values') {
-          newData[targetRow][targetCol] = cleanVal;
-        } else {
-          if (field === 'id') {
-            let newType = 'UNK';
-            let newId = cleanVal;
-            const upperVal = cleanVal.toUpperCase();
-            if (upperVal.startsWith('STD')) { newType = 'STD'; newId = cleanVal.substring(3); }
-            else if (upperVal.startsWith('CTL')) { newType = 'CTL'; newId = cleanVal.replace(/^CTL-?/i, ''); }
-            else if (upperVal === 'BLK') { newType = 'BLK'; newId = ''; }
-            else if (cleanVal === '') { newType = 'EMPTY'; newId = null; }
-            else { newType = 'UNK'; newId = cleanVal; }
-            newData[targetRow][targetCol] = { type: newType, id: newId };
-          }
+    const rawRows = clipboardData.split(/\r\n|\n|\r/).filter(row => row.trim() !== '');
+    if (rawRows.length === 0) return;
+
+    // 解析剪貼簿中的所有行與欄
+    const parsedGrid = rawRows.map(rowStr => rowStr.split('\t').map(c => c.trim()));
+    const isSingleColumn = parsedGrid.length > 1 && parsedGrid.every(cols => cols.length === 1);
+    const isSingleRow = parsedGrid.length === 1 && parsedGrid[0].length > 1;
+
+    // 深拷貝 data 陣列
+    const newData = data.map(row => row.map(cell => (typeof cell === 'object' && cell !== null ? { ...cell } : cell)));
+
+    const applyValue = (r, c, cleanVal) => {
+      if (r < 0 || r >= 8 || c < 0 || c >= 12) return;
+      if (type === 'values') {
+        newData[r][c] = cleanVal;
+      } else {
+        if (field === 'id') {
+          newData[r][c] = parseLayoutCell(cleanVal);
+        }
+      }
+    };
+
+    if (isSingleColumn) {
+      // 依欄依序垂直貼上 (A1->H1 -> A2->H2 ...)
+      let currR = rIndex;
+      let currC = cIndex;
+      parsedGrid.forEach(([val]) => {
+        if (currC >= 12) return;
+        applyValue(currR, currC, val);
+        currR++;
+        if (currR >= 8) {
+          currR = 0;
+          currC++;
         }
       });
-    });
+    } else if (isSingleRow) {
+      // 依列依序水平貼上 (A1->A12 -> B1->B12 ...)
+      let currR = rIndex;
+      let currC = cIndex;
+      parsedGrid[0].forEach(val => {
+        if (currR >= 8) return;
+        applyValue(currR, currC, val);
+        currC++;
+        if (currC >= 12) {
+          currC = 0;
+          currR++;
+        }
+      });
+    } else {
+      // 二維矩陣貼上 (保持行列對齊)
+      parsedGrid.forEach((rowCols, rOffset) => {
+        const targetRow = rIndex + rOffset;
+        if (targetRow >= 8) return;
+        rowCols.forEach((val, cOffset) => {
+          const targetCol = cIndex + cOffset;
+          if (targetCol >= 12) return;
+          applyValue(targetRow, targetCol, val);
+        });
+      });
+    }
+
     setData(newData);
   };
 
