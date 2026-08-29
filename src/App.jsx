@@ -427,7 +427,7 @@ export default function App() {
     const demoLayout = getAutoLayout(repeatSettings, INITIAL_STD_CONCS);
     setLayout(demoLayout);
     const newOds = createEmptyGrid('');
-    const trueParams = { a: 0.05, d: 2.5, c: 15, b: 1.2, g: 0.8 };
+    const trueParams = { a: 2.5, d: 0.05, c: 15, b: 1.2, g: 0.8 };
     const p_vec = [trueParams.a, trueParams.d, trueParams.c, trueParams.b, trueParams.g];
     for (let r = 0; r < 8; r++) {
       for (let c = 0; c < 12; c++) {
@@ -440,8 +440,9 @@ export default function App() {
             newOds[r][c] = (val + (Math.random() - 0.5) * 0.04).toFixed(3);
           }
         } else if (cell.type === 'CTL') {
-          const base = cell.id === 'L' ? 0.2 : 1.8;
-          newOds[r][c] = (base + (Math.random() - 0.5) * 0.05).toFixed(3);
+          const targetConc = cell.id === 'H' ? 100 : 20;
+          const val = calculate5PL(targetConc, p_vec);
+          newOds[r][c] = (val + (Math.random() - 0.5) * 0.03).toFixed(3);
         } else if (cell.type === 'UNK') {
           const randConc = Math.random() * 90 + 2;
           const val = calculate5PL(randConc, p_vec);
