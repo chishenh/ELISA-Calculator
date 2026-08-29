@@ -54,36 +54,50 @@ const Matrix = {
 };
 
 // --- 5PL Logic ---
-const calculate5PL = (x, [a, d, c, b, g]) => {
-  if (x <= 0) return a;
-  return d + (a - d) / Math.pow((1 + Math.pow(x / c, b)), g);
+const calculate5PL = (x, [a, d, c, b, g = 1.0]) => {
+  if (x <= 0) {
+    return b < 0 ? d : a;
+  }
+  try {
+    const xc = x / c;
+    const xc_b = Math.pow(xc, b);
+    const base = 1 + xc_b;
+    return d + (a - d) / Math.pow(base, g);
+  } catch (e) {
+    return NaN;
+  }
 };
 
-const calculateConcentration = (y, [a, d, c, b, g]) => {
+const calculateConcentration = (y, [a, d, c, b, g = 1.0]) => {
   const minAsymp = Math.min(a, d);
   const maxAsymp = Math.max(a, d);
-  const eps = 1e-6;
-  if (y < minAsymp - eps || y > maxAsymp + eps) return NaN;
+  if (y <= minAsymp || y >= maxAsymp) return NaN;
 
   try {
     const term1 = (a - d) / (y - d);
     if (term1 <= 0) return NaN;
-    const term2 = Math.pow(term1, 1 / g) - 1;
-    if (term2 < 0) return NaN;
+    let term2;
+    if (g > 500) {
+      term2 = Math.expm1(Math.log(term1) / g);
+    } else {
+      term2 = Math.pow(term1, 1 / g) - 1;
+    }
+    if (term2 <= 0) return NaN;
     return c * Math.pow(term2, 1 / b);
   } catch (e) { return NaN; }
 };
 
 const solveLevenbergMarquardt = (dataPoints, initialParamsObj) => {
   let p = [initialParamsObj.a, initialParamsObj.d, initialParamsObj.c, initialParamsObj.b, initialParamsObj.g];
-  const maxIter = 200;
-  let lambda = 0.01;
+  const maxIter = 1000;
+  let lambda = 0.001;
   const tolerance = 1e-8;
 
   const getSSE = (params) => {
-    // a (params[0]) and d (params[1]) can be negative (e.g. background-subtracted OD).
-    // c, b, g (params[2], [3], [4]) must remain positive to avoid NaN in Math.log/Math.pow.
-    if (params[2] <= 1e-9 || params[3] <= 1e-9 || params[4] <= 1e-9) return Infinity;
+    const c = params[2];
+    const g = params[4];
+    if (c <= 1e-9 || g <= 1e-9) return Infinity;
+
     return dataPoints.reduce((acc, point) => {
       const diff = point.y - calculate5PL(point.x, params);
       return acc + diff * diff;
@@ -94,16 +108,21 @@ const solveLevenbergMarquardt = (dataPoints, initialParamsObj) => {
 
   for (let iter = 0; iter < maxIter; iter++) {
     let J = [], r = [];
-    const [a, d, c, b, g] = p;
+    const a = p[0], d = p[1], c = p[2], b = p[3], g = p[4];
+    const fullParams = [a, d, c, b, g];
 
     for (let point of dataPoints) {
       const { x, y: y_obs } = point;
-      const y_pred = calculate5PL(x, p);
+      const y_pred = calculate5PL(x, fullParams);
       r.push(y_obs - y_pred);
 
       let row = [0, 0, 0, 0, 0];
       if (x <= 0) {
-        row = [1, 0, 0, 0, 0];
+        if (b < 0) {
+          row[1] = 1; // 競爭型 x=0 時對應漸近線 d
+        } else {
+          row[0] = 1; // 夾心型 x=0 時對應漸近線 a
+        }
       } else {
         const xc = x / c;
         const xc_b = Math.pow(xc, b);
@@ -114,9 +133,9 @@ const solveLevenbergMarquardt = (dataPoints, initialParamsObj) => {
         const dy_dbase = (a - d) * (-g) * Math.pow(base, -g - 1);
         const dbase_dc = -(b / c) * xc_b;
         row[2] = dy_dbase * dbase_dc;
-        const dbase_db = xc_b * Math.log(xc);
+        const dbase_db = xc_b * Math.log(Math.max(1e-12, xc));
         row[3] = dy_dbase * dbase_db;
-        row[4] = - ((a - d) / denom) * Math.log(base);
+        row[4] = - ((a - d) / denom) * Math.log(Math.max(1e-12, base));
       }
       J.push(row);
     }
@@ -125,7 +144,7 @@ const solveLevenbergMarquardt = (dataPoints, initialParamsObj) => {
     const JTJ = Matrix.multiply(JT, J);
     const JTr = Matrix.multiplyVector(JT, r);
 
-    let A = JTJ.map((row, i) => row.map((val, j) => i === j ? val * (1 + lambda) : val));
+    let A = JTJ.map((row, i) => row.map((val, j) => i === j ? val * (1 + lambda) + 1e-11 : val));
 
     let delta;
     try { delta = Matrix.solveLinearSystem(A, JTr); }
@@ -135,13 +154,14 @@ const solveLevenbergMarquardt = (dataPoints, initialParamsObj) => {
     const newSSE = getSSE(p_new);
 
     if (isFinite(newSSE) && newSSE < currentSSE) {
+      const relChange = Math.abs(currentSSE - newSSE) / (currentSSE + 1e-12);
       p = p_new;
       lambda /= 10;
-      if (Math.abs(currentSSE - newSSE) < tolerance) { currentSSE = newSSE; break; }
+      if (relChange < tolerance) { currentSSE = newSSE; break; }
       currentSSE = newSSE;
     } else {
       lambda *= 10;
-      if (lambda > 1e12) break;
+      if (lambda > 1e14) break;
     }
   }
   return { a: p[0], d: p[1], c: p[2], b: p[3], g: p[4], sse: currentSSE };
@@ -463,7 +483,8 @@ export default function App() {
     let minDiff = Math.abs(points[0].y - midY);
     for (let p of points) { const diff = Math.abs(p.y - midY); if (diff < minDiff) { minDiff = diff; closestP = p; } }
     const initC = closestP.x > 0 ? closestP.x : 10;
-    const initialParams = { a: initA, d: initD, c: initC, b: 1.0, g: 1.0 };
+    const initB = isIncreasing ? 1.0 : -1.0;
+    const initialParams = { a: initA, d: initD, c: initC, b: initB, g: 1.0 };
     const resultParams = solveLevenbergMarquardt(points, initialParams);
     const yMean = points.reduce((acc, p) => acc + p.y, 0) / points.length;
     const ssTot = points.reduce((acc, p) => acc + Math.pow(p.y - yMean, 2), 0);
