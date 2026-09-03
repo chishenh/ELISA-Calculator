@@ -53,19 +53,10 @@ const Matrix = {
   }
 };
 
-// --- 5PL Logic ---
+// --- SoftMax Pro (4PL / 5PL Levenberg-Marquardt Engine) ---
 const calculate5PL = (x, [a, d, c, b, g = 1.0]) => {
-  if (x <= 0) {
-    return b < 0 ? d : a;
-  }
-  try {
-    const xc = x / c;
-    const xc_b = Math.pow(xc, b);
-    const base = 1 + xc_b;
-    return d + (a - d) / Math.pow(base, g);
-  } catch (e) {
-    return NaN;
-  }
+  if (x <= 0) return a;
+  return d + (a - d) / Math.pow((1 + Math.pow(x / c, b)), g);
 };
 
 const calculateConcentration = (y, [a, d, c, b, g = 1.0]) => {
@@ -87,19 +78,26 @@ const calculateConcentration = (y, [a, d, c, b, g = 1.0]) => {
   } catch (e) { return NaN; }
 };
 
-const solveLevenbergMarquardt = (dataPoints, initialParamsObj) => {
-  let p = [initialParamsObj.a, initialParamsObj.d, initialParamsObj.c, initialParamsObj.b, initialParamsObj.g];
-  const maxIter = 1000;
-  let lambda = 0.001;
-  const tolerance = 1e-8;
+const solveSoftMaxPro = (dataPoints, initialParamsObj, modelType = '4PL', constrainPositive = false, lockedIndices = []) => {
+  const is4PL = modelType === '4PL';
+  let p = is4PL
+    ? [initialParamsObj.a, initialParamsObj.d, initialParamsObj.c, initialParamsObj.b]
+    : [initialParamsObj.a, initialParamsObj.d, initialParamsObj.c, initialParamsObj.b, initialParamsObj.g];
+  const maxIter = 5000;
+  let lambda = 1e-4;
+  const tolerance = 1e-15;
 
   const getSSE = (params) => {
     const c = params[2];
-    const g = params[4];
+    const g = is4PL ? 1.0 : params[4];
     if (c <= 1e-9 || g <= 1e-9) return Infinity;
 
+    if (constrainPositive) {
+      if (params.some((val, idx) => !lockedIndices.includes(idx) && idx !== 3 && idx !== 0 && val <= 1e-9)) return Infinity;
+    }
+    const fullParams = is4PL ? [...params, 1.0] : params;
     return dataPoints.reduce((acc, point) => {
-      const diff = point.y - calculate5PL(point.x, params);
+      const diff = point.y - calculate5PL(point.x, fullParams);
       return acc + diff * diff;
     }, 0);
   };
@@ -108,7 +106,7 @@ const solveLevenbergMarquardt = (dataPoints, initialParamsObj) => {
 
   for (let iter = 0; iter < maxIter; iter++) {
     let J = [], r = [];
-    const a = p[0], d = p[1], c = p[2], b = p[3], g = p[4];
+    const a = p[0], d = p[1], c = p[2], b = p[3], g = is4PL ? 1.0 : p[4];
     const fullParams = [a, d, c, b, g];
 
     for (let point of dataPoints) {
@@ -116,13 +114,9 @@ const solveLevenbergMarquardt = (dataPoints, initialParamsObj) => {
       const y_pred = calculate5PL(x, fullParams);
       r.push(y_obs - y_pred);
 
-      let row = [0, 0, 0, 0, 0];
+      let row = is4PL ? [0, 0, 0, 0] : [0, 0, 0, 0, 0];
       if (x <= 0) {
-        if (b < 0) {
-          row[1] = 1; // 競爭型 x=0 時對應漸近線 d
-        } else {
-          row[0] = 1; // 夾心型 x=0 時對應漸近線 a
-        }
+        row[0] = 1.0; // SoftMax Pro: x=0 時 y 始終趨近 A
       } else {
         const xc = x / c;
         const xc_b = Math.pow(xc, b);
@@ -135,7 +129,9 @@ const solveLevenbergMarquardt = (dataPoints, initialParamsObj) => {
         row[2] = dy_dbase * dbase_dc;
         const dbase_db = xc_b * Math.log(Math.max(1e-12, xc));
         row[3] = dy_dbase * dbase_db;
-        row[4] = - ((a - d) / denom) * Math.log(Math.max(1e-12, base));
+        if (!is4PL) {
+          row[4] = - ((a - d) / denom) * Math.log(Math.max(1e-12, base));
+        }
       }
       J.push(row);
     }
@@ -144,27 +140,41 @@ const solveLevenbergMarquardt = (dataPoints, initialParamsObj) => {
     const JTJ = Matrix.multiply(JT, J);
     const JTr = Matrix.multiplyVector(JT, r);
 
-    let A = JTJ.map((row, i) => row.map((val, j) => i === j ? val * (1 + lambda) + 1e-11 : val));
+    let A = JTJ.map((row, i) => row.map((val, j) => i === j ? (val === 0 ? 1e-11 : val * (1 + lambda)) : val));
+
+    if (lockedIndices.length > 0) {
+      A = A.map((row, i) => {
+        if (lockedIndices.includes(i)) {
+          return row.map((_, j) => j === i ? 1.0 : 0.0);
+        }
+        return row;
+      });
+      lockedIndices.forEach(idx => {
+        if (idx < JTr.length) {
+          JTr[idx] = 0.0;
+        }
+      });
+    }
 
     let delta;
     try { delta = Matrix.solveLinearSystem(A, JTr); }
-    catch (e) { lambda *= 10; continue; }
+    catch (e) { lambda *= 5; continue; }
 
     const p_new = p.map((val, i) => val + delta[i]);
     const newSSE = getSSE(p_new);
 
     if (isFinite(newSSE) && newSSE < currentSSE) {
-      const relChange = Math.abs(currentSSE - newSSE) / (currentSSE + 1e-12);
+      const relChange = (currentSSE - newSSE) / (currentSSE + 1e-12);
       p = p_new;
-      lambda /= 10;
-      if (relChange < tolerance) { currentSSE = newSSE; break; }
+      lambda = Math.max(1e-12, lambda / 3);
       currentSSE = newSSE;
+      if (relChange < tolerance && iter > 20) { break; }
     } else {
-      lambda *= 10;
-      if (lambda > 1e14) break;
+      lambda *= 4;
+      if (lambda > 1e16) break;
     }
   }
-  return { a: p[0], d: p[1], c: p[2], b: p[3], g: p[4], sse: currentSSE };
+  return { a: p[0], d: p[1], c: p[2], b: p[3], g: is4PL ? 1.0 : p[4], sse: currentSSE, isSoftMax: true };
 };
 
 const calcStats = (values) => {
@@ -249,33 +259,31 @@ const PlateGrid = ({ data, setData, type = "layout", activeTool }) => {
     return cell.id;
   };
 
-  const parseLayoutCell = (rawVal) => {
-    if (rawVal === undefined || rawVal === null) return { type: 'EMPTY', id: null };
-    const val = String(rawVal).trim();
-    if (val === '' || val === '-' || val === '.' || val.toUpperCase() === 'EMPTY') {
-      return { type: 'EMPTY', id: null };
-    }
-    const upperVal = val.toUpperCase();
-    if (upperVal.startsWith('STD') || upperVal.startsWith('STANDARD')) {
-      const idPart = val.replace(/^(STANDARD|STD)[-_ \t]*/i, '').trim();
-      return { type: 'STD', id: idPart };
-    }
-    if (upperVal.startsWith('CTL') || upperVal.startsWith('CONTROL') || upperVal.startsWith('QC')) {
-      const idPart = val.replace(/^(CONTROL|CTL|QC)[-_ \t]*/i, '').trim();
-      return { type: 'CTL', id: idPart };
-    }
-    if (upperVal === 'BLK' || upperVal === 'BLANK' || upperVal === 'B') {
-      return { type: 'BLK', id: '' };
-    }
-    return { type: 'UNK', id: val };
-  };
-
   const handleCellClick = (rIndex, cIndex) => { };
 
   const handleTextChange = (rIndex, cIndex, val, field) => {
-    const newData = data.map(row => row.map(cell => (typeof cell === 'object' && cell !== null ? { ...cell } : cell)));
+    const newData = [...data];
     if (field === 'id') {
-      newData[rIndex][cIndex] = parseLayoutCell(val);
+      let newType = 'UNK';
+      let newId = val;
+      const upperVal = val.toUpperCase();
+      if (upperVal.startsWith('STD')) {
+        newType = 'STD';
+        newId = val.substring(3);
+      } else if (upperVal.startsWith('CTL')) {
+        newType = 'CTL';
+        newId = val.replace(/^CTL-?/i, '');
+      } else if (upperVal === 'BLK' || upperVal === 'BLANK') {
+        newType = 'BLK';
+        newId = '';
+      } else if (val === '') {
+        newType = 'EMPTY';
+        newId = null;
+      } else {
+        newType = 'UNK';
+        newId = val;
+      }
+      newData[rIndex][cIndex] = { type: newType, id: newId };
     } else {
       newData[rIndex][cIndex] = val;
     }
@@ -285,67 +293,34 @@ const PlateGrid = ({ data, setData, type = "layout", activeTool }) => {
   const handlePaste = (e, rIndex, cIndex, field) => {
     e.preventDefault();
     const clipboardData = e.clipboardData.getData('text');
-    const rawRows = clipboardData.split(/\r\n|\n|\r/).filter(row => row.trim() !== '');
-    if (rawRows.length === 0) return;
-
-    // 解析剪貼簿中的所有行與欄
-    const parsedGrid = rawRows.map(rowStr => rowStr.split('\t').map(c => c.trim()));
-    const isSingleColumn = parsedGrid.length > 1 && parsedGrid.every(cols => cols.length === 1);
-    const isSingleRow = parsedGrid.length === 1 && parsedGrid[0].length > 1;
-
-    // 深拷貝 data 陣列
-    const newData = data.map(row => row.map(cell => (typeof cell === 'object' && cell !== null ? { ...cell } : cell)));
-
-    const applyValue = (r, c, cleanVal) => {
-      if (r < 0 || r >= 8 || c < 0 || c >= 12) return;
-      if (type === 'values') {
-        newData[r][c] = cleanVal;
-      } else {
-        if (field === 'id') {
-          newData[r][c] = parseLayoutCell(cleanVal);
-        }
-      }
-    };
-
-    if (isSingleColumn) {
-      // 依欄依序垂直貼上 (A1->H1 -> A2->H2 ...)
-      let currR = rIndex;
-      let currC = cIndex;
-      parsedGrid.forEach(([val]) => {
-        if (currC >= 12) return;
-        applyValue(currR, currC, val);
-        currR++;
-        if (currR >= 8) {
-          currR = 0;
-          currC++;
+    const pasteRows = clipboardData.split(/\r\n|\n|\r/).filter(row => row.trim() !== '');
+    if (pasteRows.length === 0) return;
+    const newData = [...data];
+    pasteRows.forEach((rowStr, rOffset) => {
+      const targetRow = rIndex + rOffset;
+      if (targetRow >= 8) return;
+      const pasteCols = rowStr.split('\t');
+      pasteCols.forEach((val, cOffset) => {
+        const targetCol = cIndex + cOffset;
+        if (targetCol >= 12) return;
+        const cleanVal = val.trim();
+        if (type === 'values') {
+          newData[targetRow][targetCol] = cleanVal;
+        } else {
+          if (field === 'id') {
+            let newType = 'UNK';
+            let newId = cleanVal;
+            const upperVal = cleanVal.toUpperCase();
+            if (upperVal.startsWith('STD')) { newType = 'STD'; newId = cleanVal.substring(3); }
+            else if (upperVal.startsWith('CTL')) { newType = 'CTL'; newId = cleanVal.replace(/^CTL-?/i, ''); }
+            else if (upperVal === 'BLK') { newType = 'BLK'; newId = ''; }
+            else if (cleanVal === '') { newType = 'EMPTY'; newId = null; }
+            else { newType = 'UNK'; newId = cleanVal; }
+            newData[targetRow][targetCol] = { type: newType, id: newId };
+          }
         }
       });
-    } else if (isSingleRow) {
-      // 依列依序水平貼上 (A1->A12 -> B1->B12 ...)
-      let currR = rIndex;
-      let currC = cIndex;
-      parsedGrid[0].forEach(val => {
-        if (currR >= 8) return;
-        applyValue(currR, currC, val);
-        currC++;
-        if (currC >= 12) {
-          currC = 0;
-          currR++;
-        }
-      });
-    } else {
-      // 二維矩陣貼上 (保持行列對齊)
-      parsedGrid.forEach((rowCols, rOffset) => {
-        const targetRow = rIndex + rOffset;
-        if (targetRow >= 8) return;
-        rowCols.forEach((val, cOffset) => {
-          const targetCol = cIndex + cOffset;
-          if (targetCol >= 12) return;
-          applyValue(targetRow, targetCol, val);
-        });
-      });
-    }
-
+    });
     setData(newData);
   };
 
@@ -417,6 +392,8 @@ export default function App() {
   const [chartScale, setChartScale] = useState('log');
   const [isGeneratingDoc, setIsGeneratingDoc] = useState(false);
   const [isGeneratingExcel, setIsGeneratingExcel] = useState(false);
+  const [modelType, setModelType] = useState('4PL');
+  const [stdFitMode, setStdFitMode] = useState('avg');
   const chartRef = useRef(null);
 
   const clearLayout = () => {
@@ -462,7 +439,7 @@ export default function App() {
     const demoLayout = getAutoLayout(repeatSettings, INITIAL_STD_CONCS);
     setLayout(demoLayout);
     const newOds = createEmptyGrid('');
-    const trueParams = { a: 2.5, d: 0.05, c: 15, b: 1.2, g: 0.8 };
+    const trueParams = { a: 0.05, d: 2.5, c: 15, b: 1.2, g: 0.8 };
     const p_vec = [trueParams.a, trueParams.d, trueParams.c, trueParams.b, trueParams.g];
     for (let r = 0; r < 8; r++) {
       for (let c = 0; c < 12; c++) {
@@ -475,9 +452,8 @@ export default function App() {
             newOds[r][c] = (val + (Math.random() - 0.5) * 0.04).toFixed(3);
           }
         } else if (cell.type === 'CTL') {
-          const targetConc = cell.id === 'H' ? 100 : 20;
-          const val = calculate5PL(targetConc, p_vec);
-          newOds[r][c] = (val + (Math.random() - 0.5) * 0.03).toFixed(3);
+          const base = cell.id === 'L' ? 0.2 : 1.8;
+          newOds[r][c] = (base + (Math.random() - 0.5) * 0.05).toFixed(3);
         } else if (cell.type === 'UNK') {
           const randConc = Math.random() * 90 + 2;
           const val = calculate5PL(randConc, p_vec);
@@ -492,40 +468,64 @@ export default function App() {
 
   const handleCalculate = () => {
     let points = [];
+    let allWellPoints = [];
+    const stdMap = {};
+
     for (let r = 0; r < 8; r++) for (let c = 0; c < 12; c++) {
       const cell = layout[r][c];
       const od = parseFloat(odValues[r][c]);
       if (!isNaN(od) && cell.type === 'STD') {
         const idNum = parseInt(cell.id);
         const stdInfo = stdConcs.find(s => s.id === idNum);
-        if (stdInfo) points.push({ x: parseFloat(stdInfo.conc), y: od });
+        if (stdInfo) {
+          const conc = parseFloat(stdInfo.conc);
+          allWellPoints.push({ x: conc, y: od });
+          if (!stdMap[idNum]) stdMap[idNum] = { conc, ods: [] };
+          stdMap[idNum].ods.push(od);
+        }
       }
     }
 
-    if (points.length < 5) return alert("Please define at least 5 standard points.");
+    Object.keys(stdMap).forEach(id => {
+      const g = stdMap[id];
+      const meanOd = g.ods.reduce((a, b) => a + b, 0) / g.ods.length;
+      points.push({ x: g.conc, y: meanOd });
+    });
 
-    points.sort((a, b) => a.x - b.x);
-    const yStart = points[0].y;
-    const yEnd = points[points.length - 1].y;
+    const activeFitPoints = stdFitMode === 'raw' ? allWellPoints : points;
+    const minPointsNeeded = modelType === '5PL' ? 5 : 4;
+    if (activeFitPoints.length < minPointsNeeded) {
+      return alert(`Please define at least ${minPointsNeeded} standard points for ${modelType} fit.`);
+    }
+
+    activeFitPoints.sort((a, b) => a.x - b.x);
+    const yStart = activeFitPoints[0].y;
+    const yEnd = activeFitPoints[activeFitPoints.length - 1].y;
     const isIncreasing = yEnd > yStart;
-    const minY = Math.min(...points.map(p => p.y));
-    const maxY = Math.max(...points.map(p => p.y));
+    const minY = Math.min(...activeFitPoints.map(p => p.y));
+    const maxY = Math.max(...activeFitPoints.map(p => p.y));
     const safeMin = minY;
     const safeMax = maxY;
+
+    // SoftMax Pro standard initial parameter conventions
     let initA = isIncreasing ? safeMin : safeMax;
     let initD = isIncreasing ? safeMax : safeMin;
     const midY = (minY + maxY) / 2;
-    let closestP = points[0];
-    let minDiff = Math.abs(points[0].y - midY);
-    for (let p of points) { const diff = Math.abs(p.y - midY); if (diff < minDiff) { minDiff = diff; closestP = p; } }
+    const nonZeroPoints = activeFitPoints.filter(p => p.x > 0);
+    let closestP = nonZeroPoints.length > 0 ? nonZeroPoints[0] : activeFitPoints[0];
+    let minDiff = Math.abs(closestP.y - midY);
+    for (let p of nonZeroPoints) {
+      const diff = Math.abs(p.y - midY);
+      if (diff < minDiff) { minDiff = diff; closestP = p; }
+    }
     const initC = closestP.x > 0 ? closestP.x : 10;
-    const initB = isIncreasing ? 1.0 : -1.0;
-    const initialParams = { a: initA, d: initD, c: initC, b: initB, g: 1.0 };
-    const resultParams = solveLevenbergMarquardt(points, initialParams);
-    const yMean = points.reduce((acc, p) => acc + p.y, 0) / points.length;
-    const ssTot = points.reduce((acc, p) => acc + Math.pow(p.y - yMean, 2), 0);
-    const rSquared = ssTot === 0 ? 0 : (1 - (resultParams.sse / ssTot));
-    setFitResult({ params: resultParams, rSquared, points });
+    const initialParams = { a: initA, d: initD, c: initC, b: 1.0, g: 1.0 };
+
+    const resultParams = solveSoftMaxPro(activeFitPoints, initialParams, modelType);
+    const yMean = activeFitPoints.reduce((acc, p) => acc + p.y, 0) / activeFitPoints.length;
+    const ssTot = activeFitPoints.reduce((acc, p) => acc + Math.pow(p.y - yMean, 2), 0);
+    const rSquared = ssTot === 0 ? 0 : Math.max(0, 1 - (resultParams.sse / ssTot));
+    setFitResult({ params: resultParams, rSquared, points: activeFitPoints, modelType, stdFitMode });
 
     let calcResults = [];
     const p_vec = [resultParams.a, resultParams.d, resultParams.c, resultParams.b, resultParams.g];
@@ -616,28 +616,33 @@ export default function App() {
         }
       } catch (e) { console.error("Graph export error:", e); }
 
+      const is4PL = (fitResult.modelType || modelType) === '4PL';
+      const ec50 = is4PL ? fitResult.params.c : fitResult.params.c * Math.pow((Math.pow(2, 1 / (fitResult.params.g || 1.0)) - 1), 1 / fitResult.params.b);
       doc.setFontSize(10);
-      doc.text("Model Formula: y = D + (A - D) / ((1 + (x/C)^B)^G)", 14, chartY + 5);
+      doc.text(`Model Formula: ${is4PL ? 'y = D + (A - D) / (1 + (x/C)^B)' : 'y = D + (A - D) / ((1 + (x/C)^B)^G)'} [SoftMax Pro ${fitResult.modelType || modelType}]`, 14, chartY + 5);
 
       const { a, d } = fitResult.params;
       const isIncreasing = a < d;
       const descA = isIncreasing ? "Min Asymptote (Bottom)" : "Max Asymptote (Top)";
       const descD = isIncreasing ? "Max Asymptote (Top)" : "Min Asymptote (Bottom)";
 
-      const ec50 = fitResult.params.c * Math.pow((Math.pow(2, 1 / fitResult.params.g) - 1), 1 / fitResult.params.b);
-      doc.setFontSize(12); doc.text("3.2. 5PL Parameters & Goodness of Fit", 14, chartY + 12);
+      doc.setFontSize(12); doc.text(`3.2. SoftMax Pro ${fitResult.modelType || modelType} Parameters & Goodness of Fit`, 14, chartY + 12);
+      const pdfParamsBody = [
+        ["R-Squared", fitResult.rSquared.toFixed(5), "Coefficient of Determination"],
+        ["A", fitResult.params.a.toFixed(4), descA],
+        ["D", fitResult.params.d.toFixed(4), descD],
+        ["C", fitResult.params.c.toFixed(4), is4PL ? "Inflection Point / EC50" : "Inflection Point"],
+        ["B", fitResult.params.b.toFixed(4), "Hill Slope"]
+      ];
+      if (!is4PL) {
+        pdfParamsBody.push(["G", fitResult.params.g.toFixed(4), "Symmetry Factor"]);
+      }
+      pdfParamsBody.push(["EC50", ec50.toFixed(4), "Half Maximal Effective Concentration"]);
+
       doc.autoTable({
         startY: chartY + 17,
         head: [['Parameter', 'Value', 'Description']],
-        body: [
-          ["R-Squared", fitResult.rSquared.toFixed(5), "Coefficient of Determination"],
-          ["A", fitResult.params.a.toFixed(4), descA],
-          ["D", fitResult.params.d.toFixed(4), descD],
-          ["C", fitResult.params.c.toFixed(4), "Inflection Point"],
-          ["B", fitResult.params.b.toFixed(4), "Hill Slope"],
-          ["G", fitResult.params.g.toFixed(4), "Symmetry Factor"],
-          ["EC50", ec50.toFixed(4), "Half Maximal Effective Concentration"]
-        ],
+        body: pdfParamsBody,
         theme: 'grid',
         headStyles: { fillColor: [79, 70, 229], halign: 'center' },
         styles: { halign: 'center' },
@@ -742,9 +747,10 @@ export default function App() {
 
       // Sheet 3: Curve Fitting Results
       const ws3 = workbook.addWorksheet('Curve Fitting Results');
+      const is4PL = (fitResult.modelType || modelType) === '4PL';
       const descA_ex = fitResult.params.a < fitResult.params.d ? "Min Asymptote (Bottom)" : "Max Asymptote (Top)";
       const descD_ex = fitResult.params.a < fitResult.params.d ? "Max Asymptote (Top)" : "Min Asymptote (Bottom)";
-      const ec50_ex = fitResult.params.c * Math.pow((Math.pow(2, 1 / fitResult.params.g) - 1), 1 / fitResult.params.b);
+      const ec50_ex = is4PL ? fitResult.params.c : fitResult.params.c * Math.pow((Math.pow(2, 1 / (fitResult.params.g || 1.0)) - 1), 1 / fitResult.params.b);
 
       ws3.addRow(['Parameter', 'Value', 'Description']);
       const rSquareRow = ws3.addRow(['R-Squared', fitResult.rSquared, 'Coefficient of Determination']);
@@ -753,16 +759,19 @@ export default function App() {
       aRow.getCell(2).numFmt = '0.0000';
       const dRow = ws3.addRow(['D', fitResult.params.d, descD_ex]);
       dRow.getCell(2).numFmt = '0.0000';
-      const cRow = ws3.addRow(['C', fitResult.params.c, 'Inflection Point']);
+      const cRow = ws3.addRow(['C', fitResult.params.c, is4PL ? 'Inflection Point / EC50' : 'Inflection Point']);
       cRow.getCell(2).numFmt = '0.0000';
       const bRow = ws3.addRow(['B', fitResult.params.b, 'Hill Slope']);
       bRow.getCell(2).numFmt = '0.0000';
-      const gRow = ws3.addRow(['G', fitResult.params.g, 'Symmetry Factor']);
-      gRow.getCell(2).numFmt = '0.0000';
+      if (!is4PL) {
+        const gRow = ws3.addRow(['G', fitResult.params.g, 'Symmetry Factor']);
+        gRow.getCell(2).numFmt = '0.0000';
+      }
       const ec50Row = ws3.addRow(['EC50', ec50_ex, 'Half Maximal Effective Concentration']);
       ec50Row.getCell(2).numFmt = '0.0000';
       ws3.addRow([]);
-      ws3.addRow(['Model Formula', 'y = D + (A - D) / ((1 + (x/C)^B)^G)']);
+      ws3.addRow(['Model Formula', is4PL ? 'y = D + (A - D) / (1 + (x/C)^B)' : 'y = D + (A - D) / ((1 + (x/C)^B)^G)']);
+      ws3.addRow(['Fitting Engine', `SoftMax Pro ${fitResult.modelType || modelType} (${(fitResult.stdFitMode || stdFitMode) === 'raw' ? 'Raw OD' : 'Avg OD'} Mode)`]);
       ws3.addRow([]);
       
       try {
@@ -958,7 +967,49 @@ export default function App() {
     <div className="min-h-screen bg-gray-50 text-slate-800 font-sans">
       <header className="bg-white border-b px-6 py-4 flex items-center justify-between sticky top-0 z-20 shadow-sm">
         <div className="flex items-center gap-2 text-indigo-700"><Activity className="w-6 h-6" /><h1 className="text-xl font-bold tracking-tight">ELISA Calculator</h1></div>
-        <div className="flex gap-3"><button onClick={loadDemoData} className="flex items-center gap-2 px-3 py-1.5 text-sm bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-md"><RefreshCw className="w-4 h-4" /> Load Demo</button><button onClick={handleCalculate} className="flex items-center gap-2 px-4 py-1.5 text-sm bg-indigo-600 hover:bg-indigo-700 text-white rounded-md font-medium shadow"><Calculator className="w-4 h-4" /> Calculate Fit</button></div>
+        <div className="flex items-center gap-3">
+          <div className="flex items-center bg-gray-100 p-1 rounded-md text-xs font-semibold">
+            <span className="px-2 text-indigo-700 font-bold hidden sm:inline">SoftMax Pro</span>
+            <button
+              type="button"
+              onClick={() => setModelType('4PL')}
+              className={`px-2.5 py-1 rounded transition-colors ${modelType === '4PL' ? 'bg-white shadow text-indigo-600 font-bold' : 'text-gray-500 hover:text-gray-700'}`}
+              title="SoftMax Pro 4-Parameter Logistic"
+            >
+              4PL
+            </button>
+            <button
+              type="button"
+              onClick={() => setModelType('5PL')}
+              className={`px-2.5 py-1 rounded transition-colors ${modelType === '5PL' ? 'bg-white shadow text-indigo-600 font-bold' : 'text-gray-500 hover:text-gray-700'}`}
+              title="SoftMax Pro 5-Parameter Logistic"
+            >
+              5PL
+            </button>
+          </div>
+
+          <div className="flex items-center bg-gray-100 p-1 rounded-md text-xs font-semibold">
+            <button
+              type="button"
+              onClick={() => setStdFitMode('avg')}
+              className={`px-2.5 py-1 rounded transition-colors ${stdFitMode === 'avg' ? 'bg-white shadow text-indigo-600 font-bold' : 'text-gray-500 hover:text-gray-700'}`}
+              title="Fit standard replicate averages"
+            >
+              Avg OD
+            </button>
+            <button
+              type="button"
+              onClick={() => setStdFitMode('raw')}
+              className={`px-2.5 py-1 rounded transition-colors ${stdFitMode === 'raw' ? 'bg-white shadow text-indigo-600 font-bold' : 'text-gray-500 hover:text-gray-700'}`}
+              title="Fit all individual standard replicates"
+            >
+              Raw OD
+            </button>
+          </div>
+
+          <button onClick={loadDemoData} className="flex items-center gap-2 px-3 py-1.5 text-sm bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-md"><RefreshCw className="w-4 h-4" /> Load Demo</button>
+          <button onClick={handleCalculate} className="flex items-center gap-2 px-4 py-1.5 text-sm bg-indigo-600 hover:bg-indigo-700 text-white rounded-md font-medium shadow"><Calculator className="w-4 h-4" /> Calculate Fit</button>
+        </div>
       </header>
       <main className="max-w-7xl mx-auto p-4 md:p-6">
         <div className="mb-6 bg-blue-50 border border-blue-100 rounded-lg p-4 flex items-start gap-3 shadow-sm">
@@ -1002,7 +1053,7 @@ export default function App() {
                     </div>
                   </div>
                   <div className="flex flex-col lg:flex-row gap-6 mb-6">
-                    <div className="lg:w-1/3"><div className="bg-white border border-slate-200 rounded-lg p-5 shadow-sm h-full"><h4 className="font-bold text-slate-700 mb-4 text-base border-b pb-2">Fit Parameters</h4><div className="mb-6 p-4 bg-green-50 border border-green-100 rounded-lg text-center"><div className="text-xs text-green-600 font-semibold uppercase tracking-wider mb-1">Goodness of Fit (R²)</div><div className="text-3xl font-bold text-green-700 tracking-tight">{fitResult.rSquared.toFixed(5)}</div></div><div className="mb-4 p-3 bg-slate-50 border border-slate-200 rounded text-center"><div className="text-xs text-slate-500 mb-1">5PL Model Formula</div><div className="font-mono text-xs font-bold text-indigo-700 mt-2">y = D + (A - D) / ((1 + (x/C)^B)^G)</div></div><div className="space-y-3">{['a', 'd', 'c', 'b', 'g'].map(p => <div key={p} className="flex justify-between items-center text-sm"><span className="text-slate-500">{p.toUpperCase()}</span><span className="font-mono font-bold text-slate-700 bg-slate-50 px-2 py-0.5 rounded">{fitResult.params[p].toFixed(4)}</span></div>)}<div className="flex justify-between items-center text-sm"><span className="text-slate-500 font-bold text-indigo-700">EC50</span><span className="font-mono font-bold text-indigo-700 bg-indigo-50 px-2 py-0.5 rounded border border-indigo-200">{(fitResult.params.c * Math.pow((Math.pow(2, 1/fitResult.params.g) - 1), 1/fitResult.params.b)).toFixed(4)}</span></div></div></div></div>
+                    <div className="lg:w-1/3"><div className="bg-white border border-slate-200 rounded-lg p-5 shadow-sm h-full"><h4 className="font-bold text-slate-700 mb-4 text-base border-b pb-2 flex items-center justify-between"><span>Fit Parameters</span><span className="text-[10px] font-bold px-2 py-0.5 rounded border bg-blue-100 text-blue-800 border-blue-300">SoftMax Pro {fitResult.modelType || modelType}</span></h4><div className="mb-6 p-4 bg-green-50 border border-green-100 rounded-lg text-center"><div className="text-xs text-green-600 font-semibold uppercase tracking-wider mb-1">Goodness of Fit (R²)</div><div className="text-3xl font-bold text-green-700 tracking-tight">{fitResult.rSquared.toFixed(5)}</div></div><div className="mb-4 p-3 bg-slate-50 border border-slate-200 rounded text-center"><div className="text-xs text-slate-500 mb-1">{`SoftMax Pro ${fitResult.modelType || modelType} (${(fitResult.stdFitMode || stdFitMode) === 'raw' ? 'Raw OD' : 'Avg OD'} Mode)`}</div><div className="font-mono text-xs font-bold text-indigo-700 mt-2">{(fitResult.modelType || modelType) === '4PL' ? 'y = D + (A - D) / (1 + (x/C)^B)' : 'y = D + (A - D) / ((1 + (x/C)^B)^G)'}</div></div><div className="space-y-3">{((fitResult.modelType || modelType) === '4PL' ? ['a', 'd', 'c', 'b'] : ['a', 'd', 'c', 'b', 'g']).map(p => <div key={p} className="flex justify-between items-center text-sm"><span className="text-slate-500">{p.toUpperCase()}</span><span className="font-mono font-bold text-slate-700 bg-slate-50 px-2 py-0.5 rounded">{fitResult.params[p].toFixed(4)}</span></div>)}<div className="flex justify-between items-center text-sm"><span className="text-slate-500 font-bold text-indigo-700">EC50</span><span className="font-mono font-bold text-indigo-700 bg-indigo-50 px-2 py-0.5 rounded border border-indigo-200">{((fitResult.modelType || modelType) === '4PL' ? fitResult.params.c : (fitResult.params.c * Math.pow((Math.pow(2, 1 / (fitResult.params.g || 1.0)) - 1), 1 / fitResult.params.b))).toFixed(4)}</span></div></div></div></div>
                     <div className="lg:w-2/3"><div className="bg-white border border-slate-200 rounded-lg p-4 shadow-sm h-full flex flex-col"><div className="flex justify-between items-center mb-2"><h4 className="font-bold text-slate-700">Standard Curve</h4><div className="flex bg-gray-100 rounded p-1"><button onClick={() => setChartScale('log')} className={`px-2 py-1 text-xs rounded ${chartScale === 'log' ? 'bg-white shadow text-indigo-600 font-bold' : 'text-slate-500'}`}>Log</button><button onClick={() => setChartScale('linear')} className={`px-2 py-1 text-xs rounded ${chartScale === 'linear' ? 'bg-white shadow text-indigo-600 font-bold' : 'text-slate-500'}`}>Linear</button></div></div><div id="chart-container" className="flex-1 min-h-[400px] h-[400px] w-full"><ResponsiveContainer width="100%" height="100%"><ComposedChart margin={{ top: 20, right: 30, bottom: 50, left: 20 }}><CartesianGrid strokeDasharray="3 3" /><XAxis dataKey="x" type="number" scale={chartScale} domain={[0.1, 1000]} allowDataOverflow ticks={chartScale === 'log' ? [0.1, 1, 10, 100, 1000] : null} tickFormatter={t => chartScale === 'log' ? Number(t).toString() : parseInt(t)} label={{ value: `Concentration`, position: 'insideBottom', offset: -10 }} /><YAxis dataKey="y" type="number" label={{ value: 'OD', angle: -90, position: 'insideLeft' }} /><Tooltip labelFormatter={l => `Conc: ${Number(l).toFixed(3)}`} formatter={v => v.toFixed(3)} /><Legend verticalAlign="top" wrapperStyle={{ paddingBottom: '20px' }} /><Line data={getChartData.curve} type="monotone" dataKey="y" stroke="#4f46e5" dot={false} name="Fit Curve" isAnimationActive={false} /><Scatter data={getChartData.scatter} fill="#ef4444" name="Standards" /></ComposedChart></ResponsiveContainer></div></div></div>
                   </div>
                   {renderStdStatsTable()}
